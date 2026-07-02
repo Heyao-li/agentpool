@@ -801,6 +801,10 @@ class AgentPool[TPoolDeps = None](BaseRegistry[NodeName, MessageNode[Any, Any]])
             try:
                 self._graph_config = GraphConfig.model_validate(raw_data)
             except Exception as exc:
+                # If the YAML is an AgentsManifest (contains 'agents' field),
+                # skip GraphConfig validation - it's not a graph config
+                if "agents" in raw_data and "steps" not in raw_data:
+                    return
                 config_str = str(path_for_loading)
                 raise ValueError(
                     f"Failed to build graph config from {config_str}: {exc}"

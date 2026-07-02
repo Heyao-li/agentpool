@@ -1075,6 +1075,25 @@ class OpenCodeSessionPoolIntegration(ProtocolEventConsumerMixin):
             self._child_spawns[child_id] = event
             self._children_of.setdefault(session_id, set()).add(child_id)
 
+            # Create session for child_id so it can be queried via API
+            # This allows GET /session/{child_id} to return the session instead of 404
+            try:
+                state, _was_created = await self.session_pool.sessions.get_or_create_session(
+                    child_id,
+                    agent_name=event.source_name,
+                    parent_session_id=session_id,
+                )
+                if _was_created:
+                    await self._start_status_bridge(child_id)
+                # Ensure child session has its own context for event consumption
+                if child_id not in self._contexts:
+                    self._contexts[child_id] = EventProcessorContext(session_id=child_id)
+                    self._adapters[child_id] = OpenCodeEventAdapter(self._contexts[child_id])
+                    self._message_registered[child_id] = False
+                logger.info(f"Created session for child agent: {child_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create session for child {child_id}: {e}")
+
             # Start dedicated consumer for the child session
             await self.start_event_consumer(child_id)
         except Exception:

@@ -419,7 +419,7 @@ def create_app(*, agent: BaseAgent[Any, Any], working_dir: str | None = None) ->
                 media_type=response.headers.get("content-type"),
             )
 
-    logfire.instrument_fastapi(app)
+    # logfire.instrument_fastapi(app)  # Disabled due to OpenTelemetry incompatibility
     return app
 
 
