@@ -6,8 +6,12 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from agentpool.agents.context import AgentContext  # noqa: TC001
+from agentpool.log import get_logger
 from agentpool.resource_providers import StaticResourceProvider
 from agentpool.skills.uri_resolver import ResolvedSkillURI
+
+
+logger = get_logger(__name__)
 
 
 if TYPE_CHECKING:
@@ -16,14 +20,16 @@ if TYPE_CHECKING:
 
 
 SKILL_USAGE_GUIDANCE = """
-## Skill URI Format
+## Skill Usage
 
-Skills can be loaded using either a bare skill name or a skill:// URI:
+### Load a skill (get its SKILL.md instructions)
+- `load_skill(ctx, "skill-name")` - Load skill by name
+- `load_skill(ctx, "skill-name", "arg1 arg2")` - Load skill with arguments ($1, $2, $@ substitution)
 
-### Bare Skill Name (Backward Compatible)
-- `python-expert` - Load skill by name (searches all providers)
+### Load a reference file from a skill
+- `load_skill(ctx, "skill-name", reference_path="references/file.md")` - Load specific reference file
 
-### URI Format
+### Using skill:// URI (if resolver is available)
 - `skill://provider/skill-name` - Load skill from specific provider
 - `skill://provider/skill-name/references/file.md` - Load with reference file
 
@@ -33,7 +39,7 @@ When providing arguments, the following substitutions are made:
 - `$@` - Replaced with all arguments
 - `$ARGUMENTS` - Replaced with all arguments
 
-Example: `load_skill(ctx, "skill://local/python-expert", "arg1 arg2")`
+Example: `load_skill(ctx, "skill-name", "arg1 arg2")`
 """
 
 BASE_DESC = f"""Load a Claude Code Skill and return its instructions.
@@ -92,9 +98,41 @@ async def _load_reference_content(
     from pathlib import PurePosixPath
 
     from agentpool.skills.exceptions import ReferenceNotFoundError
+    from agentpool.skills.exceptions import SecurityError
+    from upathtools import UPath
+
+    # CRITICAL: UPath is a subclass of PurePosixPath, so isinstance(skill.skill_path, PurePosixPath)
+    # returns True for both. We MUST check UPath FIRST to handle filesystem paths correctly.
+    # Only fall through to the provider-based path for exact PurePosixPath (virtual skill:// URIs).
+
+    # For filesystem paths (UPath), load from disk
+    if isinstance(skill.skill_path, UPath):
+        ref_file = skill.skill_path / reference_path
+        # Resolve and verify the path is within the skill directory
+        try:
+            resolved_path = ref_file.resolve()
+            resolved_skill_path = skill.skill_path.resolve()
+            if not str(resolved_path).startswith(str(resolved_skill_path)):
+                raise SecurityError(f"Reference path escapes skill directory: {reference_path}")
+        except (OSError, ValueError) as e:
+            raise ReferenceNotFoundError(f"Invalid reference path: {reference_path}") from e
+
+        if not ref_file.exists():
+            logger.error("Reference file not found", reference_path=reference_path, resolved_path=str(ref_file))
+            raise ReferenceNotFoundError(str(ref_file))
+
+        content = ref_file.read_text(encoding="utf-8")
+        logger.info(
+            "Loaded skill reference from disk",
+            skill_name=skill.name,
+            reference_path=reference_path,
+            resolved_path=str(ref_file.resolve()),
+            content_length=len(content),
+        )
+        return f"\n\n## Reference: {reference_path}\n\n{content}"
 
     # For virtual paths (PurePosixPath like skill:// URIs), use the provider
-    if isinstance(skill.skill_path, PurePosixPath) and pool is not None:
+    if pool is not None:
         if pool.skill_provider is not None:
             # Always pass the canonical kebab-case skill.name to the aggregating
             # provider, which matches against Skill.name (always kebab-case).
@@ -112,70 +150,55 @@ async def _load_reference_content(
             f"Cannot load reference {reference_path}: no skill provider available"
         )
 
-    # For filesystem paths (UPath), load from disk
-    # This branch should only be reached for actual filesystem paths (UPath),
-    # not virtual paths (PurePosixPath like skill:// URIs)
-    if type(skill.skill_path) is PurePosixPath:
-        raise ReferenceNotFoundError(
-            f"Cannot load reference {reference_path}: virtual paths require a skill provider"
-        )
-
-    # After the check above, skill_path is definitely a UPath
-    from upathtools import UPath
-
-    skill_path = cast(UPath, skill.skill_path)
-
-    # Validate reference_path to prevent path traversal attacks
-    from agentpool.skills.exceptions import SecurityError
-
-    decoded_path = reference_path
-    # Check for path traversal attempts and absolute paths
-    if ".." in decoded_path.split("/") or decoded_path.startswith("/"):
-        raise SecurityError(f"Path traversal detected in reference path: {reference_path}")
-
-    ref_file = skill_path / reference_path
-    # Resolve and verify the path is within the skill directory
-    try:
-        resolved_path = ref_file.resolve()
-        resolved_skill_path = skill_path.resolve()
-        if not str(resolved_path).startswith(str(resolved_skill_path)):
-            raise SecurityError(f"Reference path escapes skill directory: {reference_path}")
-    except (OSError, ValueError) as e:
-        raise ReferenceNotFoundError(f"Invalid reference path: {reference_path}") from e
-
-    if not ref_file.exists():
-        raise ReferenceNotFoundError(str(ref_file))
-
-    content = ref_file.read_text(encoding="utf-8")
-    return f"\n\n## Reference: {reference_path}\n\n{content}"
+    # Not UPath, not a provider — this is a PurePosixPath without a provider
+    raise ReferenceNotFoundError(
+        f"Cannot load reference {reference_path}: virtual paths require a skill provider"
+    )
 
 
 async def load_skill(  # noqa: PLR0911
     ctx: AgentContext,
     skill_name: str,
     arguments: str | None = None,
+    reference_path: str | None = None,
 ) -> str:
     """Load a Claude Code Skill and return its instructions.
 
     Args:
         ctx: Agent context providing access to pool and skills
         skill_name: Name of the skill to load, or a skill:// URI.
-            Use skill:// URI to load a specific reference file:
-            skill://provider/skill-name/references/file.md
+            Examples:
+            - "translation-evaluation" — load SKILL.md from the named skill
+            - "translation-evaluation" + reference_path="references/01-addition.md"
+              — load a specific reference file from the skill's references/ directory
+            - "skill://provider/skill-name/references/file.md" — load via URI
         arguments: Optional space-separated arguments for substitution
+        reference_path: Path to a reference file within the skill directory
+            (e.g., "references/01-addition.md"). When provided, loads ONLY the
+            reference file content, not the main SKILL.md instructions.
 
     Returns:
         The full skill instructions for execution
     """
     if ctx.pool is None:
+        logger.warning("load_skill called with no pool context", skill_name=skill_name)
         return "No agent pool available - skills require pool context"
 
     # Determine if this is a URI or bare skill name
     is_uri = skill_name.startswith("skill://")
+    logger.info(
+        "load_skill called",
+        skill_name=skill_name,
+        is_uri=is_uri,
+        arguments=arguments,
+        reference_path=reference_path,
+        agent_name=ctx.node_name,
+    )
 
     try:
         resolved = ResolvedSkillURI.parse(skill_name)
     except Exception as e:  # noqa: BLE001
+        logger.error("Invalid skill URI", skill_name=skill_name, error=str(e))
         return f"Invalid skill name or URI {skill_name!r}: {e}"
 
     if is_uri:
@@ -186,7 +209,15 @@ async def load_skill(  # noqa: PLR0911
 
         try:
             skill = await resolver.resolve(skill_name)
+            logger.info(
+                "Skill URI resolved",
+                skill_name=skill.name,
+                skill_path=str(skill.skill_path),
+                provider=resolved.provider,
+                reference_path=resolved.reference_path,
+            )
         except Exception as e:  # noqa: BLE001
+            logger.error("Failed to resolve skill URI", skill_name=skill_name, error=str(e))
             return f"Failed to resolve skill URI {skill_name!r}: {e}"
 
         # Check for reference path first
@@ -196,12 +227,20 @@ async def load_skill(  # noqa: PLR0911
         ref_path = resolved.reference_path or getattr(skill, "_resolved_reference_path", None)
 
         if ref_path:
+            logger.info("Loading skill reference file", skill_name=skill.name, ref_path=ref_path)
             # Reference-only loading: skip main SKILL.md content
             try:
                 ref_content = await _load_reference_content(skill, ref_path, pool=ctx.pool)
                 instructions = ref_content
             except Exception as e:  # noqa: BLE001
+                logger.error("Failed to load reference", skill_name=skill.name, ref_path=ref_path, error=str(e))
                 return f"Failed to load reference {ref_path!r}: {e}"
+            logger.info(
+                "Skill reference loaded successfully",
+                skill_name=skill.name,
+                ref_path=ref_path,
+                content_length=len(instructions),
+            )
         else:
             # Full skill loading: get main instructions
             # For virtual paths (PurePosixPath), fetch from provider
@@ -219,58 +258,70 @@ async def load_skill(  # noqa: PLR0911
                 instructions = skill.load_instructions()
     else:
         # Bare skill name - use skill_resolver to search across all providers
-        # This supports dynamic skill discovery from MCP servers with proper priority
         resolver: SkillURIResolver | None = getattr(ctx.pool, "skill_resolver", None)
+        skill: Skill | None = None
         if resolver is not None:
             try:
-                # Try to resolve via skill_resolver using bare skill name
-                # (searches all providers in priority order)
                 skill = await resolver.resolve(resolved.skill_name)
-                # For virtual paths (PurePosixPath), fetch from provider
-                if isinstance(skill.skill_path, PurePosixPath):
-                    if ctx.pool.skill_provider is not None:
-                        try:
-                            instructions = await ctx.pool.skill_provider.get_skill_instructions(
-                                skill.name
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            return f"Failed to load skill instructions for {skill.name!r}: {e}"
-                    else:
-                        instructions = ""
-                else:
-                    instructions = skill.load_instructions()
-            except Exception:
-                # Fallback: check local skills directly
-                skills = ctx.pool.skills.list_skills()
-                visible_skills = [
-                    s for s in skills if not getattr(s, "disable_model_invocation", False)
-                ]
-                found_skill: Skill | None = next(
-                    (s for s in visible_skills if s.name == resolved.skill_name), None
+                logger.info(
+                    "Bare skill name resolved",
+                    skill_name=skill.name,
+                    skill_path=str(skill.skill_path),
                 )
-                if found_skill is None:
-                    available = ", ".join(s.name for s in visible_skills)
-                    return f"Skill {resolved.skill_name!r} not found. Available skills: {available}"
-                skill = found_skill
-                try:
-                    instructions = ctx.pool.skills.get_skill_instructions(resolved.skill_name)
-                except Exception as e:  # noqa: BLE001
-                    return f"Failed to load skill {resolved.skill_name!r}: {e}"
-        else:
-            # Fallback when no resolver available - check local skills only
-            skills = ctx.pool.skills.list_skills()
+            except Exception:
+                pass
+
+        if skill is None:
+            # Fallback: check local skills directly
+            skills = ctx.pool.skills.list_skills() if ctx.pool.skills else []
             visible_skills = [
                 s for s in skills if not getattr(s, "disable_model_invocation", False)
             ]
-            found_skill = next((s for s in visible_skills if s.name == resolved.skill_name), None)
-            if found_skill is None:
+            skill = next(
+                (s for s in visible_skills if s.name == resolved.skill_name), None
+            )
+            if skill is None:
                 available = ", ".join(s.name for s in visible_skills)
                 return f"Skill {resolved.skill_name!r} not found. Available skills: {available}"
-            skill = found_skill
+
+        # If reference_path is provided directly, use it
+        if reference_path:
+            logger.info(
+                "Loading skill reference via reference_path parameter",
+                skill_name=skill.name,
+                reference_path=reference_path,
+            )
             try:
-                instructions = ctx.pool.skills.get_skill_instructions(resolved.skill_name)
+                ref_content = await _load_reference_content(skill, reference_path, pool=ctx.pool)
+                instructions = ref_content
             except Exception as e:  # noqa: BLE001
-                return f"Failed to load skill {resolved.skill_name!r}: {e}"
+                logger.error(
+                    "Failed to load reference via reference_path",
+                    skill_name=skill.name,
+                    reference_path=reference_path,
+                    error=str(e),
+                )
+                return f"Failed to load reference {reference_path!r}: {e}"
+            logger.info(
+                "Skill reference loaded successfully via reference_path",
+                skill_name=skill.name,
+                reference_path=reference_path,
+                content_length=len(instructions),
+            )
+        else:
+            # Full skill loading
+            if isinstance(skill.skill_path, PurePosixPath):
+                if ctx.pool.skill_provider is not None:
+                    try:
+                        instructions = await ctx.pool.skill_provider.get_skill_instructions(
+                            skill.name
+                        )
+                    except Exception:
+                        instructions = ""
+                else:
+                    instructions = ""
+            else:
+                instructions = skill.load_instructions()
 
     # Apply argument substitution
     instructions = _substitute_arguments(instructions, arguments)
@@ -313,7 +364,15 @@ async def load_skill(  # noqa: PLR0911
         if is_uri and resolved.provider:
             parts.append(f"URI: skill://{resolved.provider}/{resolved.skill_name}")
 
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    logger.info(
+        "load_skill returning result",
+        skill_name=skill.name,
+        is_reference_load=is_reference_load,
+        content_length=len(result),
+        is_uri=is_uri,
+    )
+    return result
 
 
 async def list_skills(ctx: AgentContext) -> str:
@@ -372,22 +431,12 @@ async def list_skills(ctx: AgentContext) -> str:
     lines.append("")
     lines.append("## Usage")
     lines.append("")
-    lines.append("Load a skill by name (backward compatible):")
+    lines.append("Load a skill by name:")
     lines.append("```python")
     lines.append('await load_skill(ctx, "skill-name")')
+    lines.append('await load_skill(ctx, "skill-name", "arg1 arg2")  # with argument substitution')
+    lines.append('await load_skill(ctx, "skill-name", reference_path="references/file.md")  # load reference file')
     lines.append("```")
-    lines.append("")
-
-    if has_resolver:
-        lines.append("Or use a skill:// URI:")
-        lines.append("```python")
-        lines.append('await load_skill(ctx, "skill://provider/skill-name")')
-        lines.append("```")
-        lines.append("")
-        lines.append("With arguments for substitution:")
-        lines.append("```python")
-        lines.append('await load_skill(ctx, "skill://provider/skill-name", "arg1 arg2")')
-        lines.append("```")
 
     return "\n".join(lines)
 
